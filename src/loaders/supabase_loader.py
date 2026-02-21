@@ -1,0 +1,489 @@
+"""
+Supabase loader for storing product metadata and images.
+
+Stores product metadata in PostgreSQL and images in Supabase Storage.
+"""
+
+import asyncio
+import os
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import httpx
+from dotenv import load_dotenv
+from rich.console import Console
+from supabase import Client, create_client
+
+# Load .env file from project root (optional - credentials are hardcoded as fallback)
+load_dotenv(Path(__file__).parent.parent.parent / ".env")
+
+console = Console()
+
+# ============================================
+# SUPABASE CREDENTIALS (Hardcoded for easy sharing)
+# ============================================
+# These credentials allow anyone who clones the repo to connect immediately
+DEFAULT_SUPABASE_URL = "https://uochfddhtkzrvcmfwksm.supabase.co"
+DEFAULT_SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVvY2hmZGRodGt6cnZjbWZ3a3NtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg1MDA1NDEsImV4cCI6MjA4NDA3NjU0MX0.mzBTf1GV8_Vk-nIMvf26PxI_MAqZfStzRTEZBEvHyLU"
+
+
+class SupabaseLoader:
+    """
+    Loads scraped product data into Supabase.
+
+    - Product metadata -> PostgreSQL database
+    - Product images -> Supabase Storage bucket
+    """
+
+    def __init__(
+        self,
+        supabase_url: Optional[str] = None,
+        supabase_key: Optional[str] = None,
+        bucket_name: str = "product-images",
+    ):
+        """
+        Initialize the Supabase loader.
+
+        Args:
+            supabase_url: Supabase project URL (or set SUPABASE_URL env var, or uses hardcoded default)
+            supabase_key: Supabase anon/service key (or set SUPABASE_KEY env var, or uses hardcoded default)
+            bucket_name: Name of the storage bucket for images
+        """
+        # Use provided values, then env vars, then hardcoded defaults
+        self.supabase_url = (
+            supabase_url or os.getenv("SUPABASE_URL") or DEFAULT_SUPABASE_URL
+        )
+        self.supabase_key = (
+            supabase_key or os.getenv("SUPABASE_KEY") or DEFAULT_SUPABASE_KEY
+        )
+
+        self.client: Client = create_client(self.supabase_url, self.supabase_key)
+        self.bucket_name = bucket_name
+        self._ensure_bucket_exists()
+
+    def _ensure_bucket_exists(self) -> None:
+        """Check if the storage bucket exists (creation requires service_role key)."""
+        try:
+            # Try to list files in the bucket to verify it exists
+            # Note: Creating buckets requires service_role key, not anon key
+            self.client.storage.from_(self.bucket_name).list(limit=1)
+            console.print(
+                f"[dim]✓ Storage bucket '{self.bucket_name}' accessible[/dim]"
+            )
+        except Exception as e:
+            # Bucket might not exist or we don't have permissions
+            console.print(
+                f"[yellow]Warning: Could not access bucket '{self.bucket_name}'. "
+                f"Make sure it exists in Supabase Storage.[/yellow]"
+            )
+
+    async def save_product(
+        self,
+        product_id: str,
+        name: str,
+        category: str,
+        url: str,
+        brand_name: str = "Zara",
+        price_current: Optional[float] = None,
+        price_original: Optional[float] = None,
+        currency: str = "USD",
+        description: Optional[str] = None,
+        colors: Optional[list[str]] = None,
+        color: Optional[str] = None,
+        parent_product_id: Optional[str] = None,
+        sizes: Optional[list] = None,
+        materials: Optional[list[str]] = None,
+        image_urls: Optional[list[str]] = None,
+        image_urls_all: Optional[list[str]] = None,
+        image_urls_stored_indices: Optional[list[int]] = None,
+        composition: Optional[str] = None,
+        composition_structured: Optional[dict] = None,
+        category_refitd: Optional[str] = None,
+        top_layer_role: Optional[str] = None,
+    ) -> dict:
+        """
+        Save a product to Supabase.
+
+        Args:
+            product_id: Unique product identifier
+            name: Product name
+            category: Product category
+            url: Source URL
+            brand_name: Brand name (e.g. Zara) - hard filter for generator
+            price_current: Current price
+            price_original: Original price (if on sale)
+            currency: Currency code
+            description: Product description
+            colors: Available colors (all colors for the product)
+            color: Single color for this variant (if expanded by color)
+            parent_product_id: Original product ID if this is a color variant
+            sizes: Available sizes (can be list of strings or list of dicts with availability)
+            materials: Material composition
+            image_urls: List of image URLs to download and store (the 2 lay-flat; only these are uploaded)
+            image_urls_all: Full list of scraped image URLs (for viewer display; not uploaded)
+            image_urls_stored_indices: 0-based indices into image_urls_all for the 2 we store (for viewer badge)
+            composition: Fabric composition string (e.g., "100% cotton") - legacy format
+            composition_structured: Hierarchical composition data with parts/areas/components
+            category_refitd: ReFitd slot - 'outerwear' | 'top' | 'bottom' | 'footwear' (for generator queries)
+            top_layer_role: For tops only - 'base' | 'mid' (nullable)
+
+        Returns:
+            Dict with saved product info including storage paths
+        """
+        console.print(f"[cyan]Saving product to Supabase: {name} ({product_id})[/cyan]")
+
+        # Storage category: normalize footwear (transformer may pass "Shoes" / "Boots")
+        storage_category = (
+            "footwear"
+            if (category or "").strip().lower() in ("shoes", "footwear", "boots")
+            else category
+        )
+
+        # Upload images first and get storage paths (use storage_category for path)
+        image_paths = []
+        if image_urls:
+            image_paths = await self._upload_images(product_id, storage_category, image_urls)
+
+        # Process sizes - handle both old format (list of strings) and new format (list of dicts)
+        sizes_list = sizes or []
+        sizes_availability = []
+        sizes_simple = []
+
+        for size_item in sizes_list:
+            if isinstance(size_item, dict):
+                # New format: {"size": "M", "available": true}
+                sizes_availability.append(size_item)
+                sizes_simple.append(size_item.get("size", ""))
+            else:
+                # Old format: just a string
+                sizes_simple.append(str(size_item))
+                sizes_availability.append({"size": str(size_item), "available": True})
+
+        # Prepare product record (include optional columns for "all images" viewer feature)
+        product_data = {
+            "product_id": product_id,
+            "name": name,
+            "category": storage_category,
+            "url": url,
+            "brand_name": brand_name or "Zara",  # Hard filter for generator
+            "category_refitd": category_refitd,
+            "top_layer_role": top_layer_role,
+            "price_current": price_current,
+            "price_original": price_original,
+            "currency": currency,
+            "description": description,
+            "colors": colors or [],
+            "color": color,  # Single color for this variant (if expanded by color)
+            "parent_product_id": parent_product_id,  # Original product ID if this is a color variant
+            "sizes": sizes_simple,  # Keep simple list for backward compatibility
+            "sizes_availability": sizes_availability,  # New JSONB column with availability
+            "sizes_checked_at": datetime.utcnow().isoformat()
+            + "Z",  # When sizes were last checked
+            "materials": materials or [],
+            "composition": composition,  # Fabric composition string (legacy)
+            "composition_structured": composition_structured,  # Hierarchical composition data
+            "image_paths": image_paths,
+            "image_urls": image_urls or [],  # The 2 lay-flat URLs we store; used for AI tagging
+            "image_urls_all": image_urls_all or [],  # Full list of scraped URLs (viewer display only)
+            "image_urls_stored_indices": image_urls_stored_indices or [],  # Indices into image_urls_all for the 2 stored
+            "image_count": len(image_paths),
+            "scraped_at": datetime.utcnow().isoformat() + "Z",
+        }
+
+        # Upsert: if DB doesn't have image_urls_all / image_urls_stored_indices yet, retry without them
+        try:
+            result = (
+                self.client.table("products")
+                .upsert(product_data, on_conflict="product_id")
+                .execute()
+            )
+        except Exception as e:
+            err_msg = (getattr(e, "message", None) or str(e) or "").lower()
+            code = getattr(e, "code", None) or ""
+            is_column_missing = (
+                str(code).upper() == "PGRST204"
+                or "pgrst204" in str(e).lower()
+                or "pgrst204" in err_msg
+            ) and (
+                "image_urls_all" in err_msg
+                or "image_urls_stored_indices" in err_msg
+                or "image_urls_all" in str(e).lower()
+                or "image_urls_stored_indices" in str(e).lower()
+            )
+            if is_column_missing:
+                # Schema not migrated yet: save without optional columns so products still persist
+                product_data.pop("image_urls_all", None)
+                product_data.pop("image_urls_stored_indices", None)
+                result = (
+                    self.client.table("products")
+                    .upsert(product_data, on_conflict="product_id")
+                    .execute()
+                )
+                console.print(
+                    "[dim]Tip: Run the migration in docs/supabase_schema.sql to add "
+                    "image_urls_all and image_urls_stored_indices for 'all photos' in the viewer.[/dim]"
+                )
+            else:
+                raise
+
+        console.print(f"[green]✓ Saved: {name} ({len(image_paths)} images)[/green]")
+
+        return {
+            "product_id": product_id,
+            "name": name,
+            "image_paths": image_paths,
+            "db_record": result.data[0] if result.data else None,
+        }
+
+    async def _upload_images(
+        self, product_id: str, category: str, image_urls: list[str]
+    ) -> list[str]:
+        """
+        Download and upload images to Supabase Storage.
+
+        Args:
+            product_id: Product ID for organizing images
+            category: Category for path organization
+            image_urls: URLs of images to download
+
+        Returns:
+            List of storage paths for uploaded images
+        """
+        storage_paths = []
+
+        # Headers to mimic a browser request (Zara blocks requests without proper headers)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.zara.com/",
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        }
+
+        async with httpx.AsyncClient(headers=headers) as http_client:
+            for i, url in enumerate(image_urls):
+                try:
+                    # Download image
+                    response = await http_client.get(url, timeout=30.0)
+                    response.raise_for_status()
+                    image_data = response.content
+
+                    # Determine file extension from URL or content-type
+                    content_type = response.headers.get("content-type", "image/jpeg")
+                    ext = self._get_extension(url, content_type)
+
+                    # Create storage path: category/product_id/image_0.jpg
+                    storage_path = f"{category}/{product_id}/image_{i}{ext}"
+
+                    # Upload to Supabase Storage
+                    self.client.storage.from_(self.bucket_name).upload(
+                        storage_path,
+                        image_data,
+                        {"content-type": content_type, "upsert": "true"},
+                    )
+
+                    storage_paths.append(storage_path)
+                    console.print(f"[dim]  Uploaded: {storage_path}[/dim]")
+
+                except Exception as e:
+                    console.print(
+                        f"[yellow]  Warning: Failed to upload image {i}: {e}[/yellow]"
+                    )
+
+                # Small delay between uploads
+                await asyncio.sleep(0.2)
+
+        return storage_paths
+
+    def _get_extension(self, url: str, content_type: str) -> str:
+        """Get file extension from URL or content-type."""
+        # Try URL first
+        url_lower = url.lower()
+        if ".jpg" in url_lower or ".jpeg" in url_lower:
+            return ".jpg"
+        elif ".png" in url_lower:
+            return ".png"
+        elif ".webp" in url_lower:
+            return ".webp"
+        elif ".gif" in url_lower:
+            return ".gif"
+
+        # Fall back to content-type
+        if "png" in content_type:
+            return ".png"
+        elif "webp" in content_type:
+            return ".webp"
+        elif "gif" in content_type:
+            return ".gif"
+
+        return ".jpg"
+
+    def get_image_url(self, storage_path: str) -> str:
+        """
+        Get the public URL for an image in storage.
+
+        Args:
+            storage_path: Path within the storage bucket
+
+        Returns:
+            Public URL for the image
+        """
+        return self.client.storage.from_(self.bucket_name).get_public_url(storage_path)
+
+    def get_products(
+        self,
+        category: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """
+        Retrieve products from the database.
+
+        Args:
+            category: Filter by category (optional)
+            limit: Maximum number of products to return
+
+        Returns:
+            List of product records
+        """
+        query = self.client.table("products").select("*").limit(limit)
+
+        if category:
+            query = query.eq("category", category)
+
+        result = query.execute()
+        return result.data
+
+    def get_product(self, product_id: str) -> Optional[dict]:
+        """
+        Get a single product by ID.
+
+        Args:
+            product_id: Product ID to retrieve
+
+        Returns:
+            Product record or None if not found
+        """
+        result = (
+            self.client.table("products")
+            .select("*")
+            .eq("product_id", product_id)
+            .execute()
+        )
+        return result.data[0] if result.data else None
+
+    def delete_product(self, product_id: str) -> bool:
+        """
+        Delete a product and its images.
+
+        Args:
+            product_id: Product ID to delete
+
+        Returns:
+            True if deleted successfully
+        """
+        # Get product to find image paths
+        product = self.get_product(product_id)
+        if not product:
+            return False
+
+        # Delete images from storage
+        image_paths = product.get("image_paths", [])
+        if image_paths:
+            try:
+                self.client.storage.from_(self.bucket_name).remove(image_paths)
+            except Exception as e:
+                console.print(f"[yellow]Warning: Could not delete images: {e}[/yellow]")
+
+        # Delete from database
+        self.client.table("products").delete().eq("product_id", product_id).execute()
+
+        console.print(f"[green]Deleted product: {product_id}[/green]")
+        return True
+
+    def get_stats(self) -> dict:
+        """
+        Get database statistics.
+
+        Returns:
+            Dict with product counts and categories
+        """
+        # Total count
+        total_result = (
+            self.client.table("products").select("product_id", count="exact").execute()
+        )
+        total = total_result.count or 0
+
+        # Count by category
+        all_products = self.client.table("products").select("category").execute()
+        by_category = {}
+        for p in all_products.data:
+            cat = p.get("category", "unknown")
+            by_category[cat] = by_category.get(cat, 0) + 1
+
+        return {
+            "total_products": total,
+            "by_category": by_category,
+        }
+
+    def wipe_all(self) -> int:
+        """
+        Delete ALL products and their images from Supabase.
+
+        ⚠️  WARNING: This is destructive and cannot be undone!
+
+        Returns:
+            Number of products deleted
+        """
+        console.print("[yellow]Fetching all products...[/yellow]")
+
+        # Get all products to find their image paths
+        all_products = (
+            self.client.table("products")
+            .select("product_id, image_paths, name")
+            .execute()
+        )
+        products = all_products.data or []
+
+        if not products:
+            console.print("[dim]No products found in database[/dim]")
+            return 0
+
+        console.print(f"[yellow]Found {len(products)} products to delete[/yellow]")
+
+        # Collect all image paths
+        all_image_paths = []
+        for product in products:
+            image_paths = product.get("image_paths", [])
+            if image_paths:
+                all_image_paths.extend(image_paths)
+
+        # Delete images from storage (in batches to avoid timeout)
+        if all_image_paths:
+            console.print(
+                f"[yellow]Deleting {len(all_image_paths)} images from storage...[/yellow]"
+            )
+            batch_size = 100
+            for i in range(0, len(all_image_paths), batch_size):
+                batch = all_image_paths[i : i + batch_size]
+                try:
+                    self.client.storage.from_(self.bucket_name).remove(batch)
+                    console.print(f"[dim]  Deleted batch {i // batch_size + 1}[/dim]")
+                except Exception as e:
+                    console.print(
+                        f"[yellow]  Warning: Failed to delete some images: {e}[/yellow]"
+                    )
+
+        # Delete all products from database
+        console.print("[yellow]Deleting all product records from database...[/yellow]")
+
+        # Supabase doesn't allow DELETE without a filter, so we delete by matching all product_ids
+        # Or we can use a trick: delete where product_id is not null (matches all)
+        try:
+            self.client.table("products").delete().neq("product_id", "").execute()
+            console.print(
+                f"[green]✓ Deleted {len(products)} products from database[/green]"
+            )
+        except Exception as e:
+            console.print(f"[red]Error deleting products: {e}[/red]")
+            raise
+
+        return len(products)
