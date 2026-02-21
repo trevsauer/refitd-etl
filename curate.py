@@ -2281,7 +2281,9 @@ HTML_TEMPLATE = """
             }
 
             try {
+                console.log('[DEBUG] Fetching products from /api/products...');
                 const response = await fetch('/api/products');
+                console.log('[DEBUG] Response status:', response.status);
                 if (!response.ok) {
                     const errText = await response.text();
                     showError(`Server returned ${response.status}. ${errText.slice(0, 200)}`);
@@ -2289,6 +2291,7 @@ HTML_TEMPLATE = """
                 }
 
                 const data = await response.json();
+                console.log('[DEBUG] Products received:', data.length, 'items');
 
                 // Ensure we got an array (API may return {error: "..."} on failure)
                 const list = Array.isArray(data) ? data : ((data && data.products) || []);
@@ -2297,10 +2300,13 @@ HTML_TEMPLATE = """
                     return;
                 }
 
+                console.log('[DEBUG] Product list length:', list.length);
+
                 // Store all products for filtering
                 allProducts = list;
                 filteredProducts = [...allProducts];
                 products = filteredProducts;
+                console.log('[DEBUG] Calling buildCategorySidebar and displayProduct...');
 
                 // Build the category sidebar
                 buildCategorySidebar();
@@ -3706,7 +3712,7 @@ HTML_TEMPLATE = """
             { value: 'low_confidence', label: 'Low confidence in original tags' }
         ];
 
-        const CURATION_NOTES_DELIMITER = '\n\n[Add additional notes below]\n\n';
+        const CURATION_NOTES_DELIMITER = String.fromCharCode(10, 10) + '[Add additional notes below]' + String.fromCharCode(10, 10);
 
         function buildTagChangesSummary(tagsFinal) {
             if (!tagsFinal || typeof tagsFinal !== 'object') return '';
@@ -3738,7 +3744,7 @@ HTML_TEMPLATE = """
                 if (fromVal != null && toVal != null) lines.push(`- Changed ${field} from '${fromVal}' to '${toVal}'${reason}`);
             }
             if (lines.length === 0) return '';
-            return 'Tag Changes:\n' + lines.join('\n');
+            return 'Tag Changes:\\n' + lines.join('\\n');
         }
 
         function inferErrorTypesFromChanges(tagsFinal) {
