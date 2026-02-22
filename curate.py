@@ -7237,7 +7237,13 @@ def get_curation_status(product_id):
 
 @app.route("/api/curation_status", methods=["POST"])
 def mark_product_curated():
-    """Mark a product as fully curated/complete."""
+    """Mark a product as fully curated/complete.
+
+    This function:
+    1. Updates the curation_status table
+    2. Updates products.curated_at and products.curated_by
+    3. Creates a curation_history record for training data export
+    """
     if not USE_SUPABASE or not supabase_client:
         return jsonify({"error": "Supabase not configured"}), 400
 
@@ -7245,12 +7251,15 @@ def mark_product_curated():
     product_id = data.get("product_id")
     curator = data.get("curator")
     notes = data.get("notes")
+    confidence = data.get("confidence", 4)
+    error_types = data.get("error_types", [])
+    include_in_training = data.get("include_in_training", True)
 
     if not all([product_id, curator]):
         return jsonify({"error": "Missing required fields"}), 400
 
     try:
-        # Upsert - insert or update if exists
+        # 1. Upsert curation_status table
         result = (
             supabase_client.table("curation_status")
             .upsert(
@@ -7265,14 +7274,90 @@ def mark_product_curated():
             )
             .execute()
         )
+
+        # 2. Update products table with curated_at and curated_by
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        supabase_client.table("products").update({
+            "curated_at": now_iso,
+            "curated_by": curator,
+            "training_eligible": True,
+        }).eq("product_id", product_id).execute()
+
+        # 3. Create curation_history record for training data export
+        # First, fetch the product to get original and corrected tags
+        product_result = (
+            supabase_client.table("products")
+            .select("tags_ai_raw, tags_final, name, category, description")
+            .eq("product_id", product_id)
+            .single()
+            .execute()
+        )
+
+        if product_result.data:
+            product = product_result.data
+            original_tags = product.get("tags_ai_raw") or {}
+            corrected_tags = product.get("tags_final") or {}
+
+            # Build change summary from corrected_tags feedback
+            change_parts = []
+            deleted = corrected_tags.get("deleted_tags", {})
+            added = corrected_tags.get("added_tags", {})
+            modified = corrected_tags.get("modified_tags", {})
+
+            if deleted:
+                for field, entries in deleted.items():
+                    items = entries if isinstance(entries, list) else [entries]
+                    for item in items:
+                        if isinstance(item, dict) and item.get("value"):
+                            change_parts.append(f"Removed '{item['value']}' from {field}")
+            if added:
+                for field, entries in added.items():
+                    items = entries if isinstance(entries, list) else [entries]
+                    for item in items:
+                        if isinstance(item, dict) and item.get("value"):
+                            change_parts.append(f"Added '{item['value']}' to {field}")
+            if modified:
+                for field, entry in modified.items():
+                    if isinstance(entry, dict) and entry.get("from") and entry.get("to"):
+                        change_parts.append(f"Changed {field} from '{entry['from']}' to '{entry['to']}'")
+
+            change_summary = "; ".join(change_parts) if change_parts else "No changes"
+
+            # Insert curation_history record
+            history_record = {
+                "product_id": product_id,
+                "original_ai_tags": original_tags,
+                "corrected_tags": corrected_tags,
+                "change_summary": change_summary,
+                "curator_notes": notes,
+                "error_types": error_types if error_types else [],
+                "confidence_in_correction": confidence,
+                "include_in_training": include_in_training,
+                "curator_id": curator,
+                "model_version": "gpt-4o-2024-11-20",
+                "prompt_version": "v2.1",
+            }
+
+            supabase_client.table("curation_history").insert(history_record).execute()
+
         return jsonify({"success": True, "data": result.data})
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/curation_status", methods=["DELETE"])
 def unmark_product_curated():
-    """Remove curation status from a product (mark as incomplete)."""
+    """Remove curation status from a product (mark as incomplete).
+
+    This function:
+    1. Deletes the curation_status record
+    2. Clears products.curated_at and products.curated_by
+    3. Removes the most recent curation_history record for this product
+    """
     if not USE_SUPABASE or not supabase_client:
         return jsonify({"error": "Supabase not configured"}), 400
 
@@ -7283,14 +7368,40 @@ def unmark_product_curated():
         return jsonify({"error": "Missing product_id"}), 400
 
     try:
+        # 1. Delete from curation_status
         result = (
             supabase_client.table("curation_status")
             .delete()
             .eq("product_id", product_id)
             .execute()
         )
+
+        # 2. Clear curated_at and curated_by from products table
+        supabase_client.table("products").update({
+            "curated_at": None,
+            "curated_by": None,
+            "training_eligible": False,
+        }).eq("product_id", product_id).execute()
+
+        # 3. Delete the most recent curation_history record for this product
+        # (fetch first to get the ID, then delete)
+        history_result = (
+            supabase_client.table("curation_history")
+            .select("id")
+            .eq("product_id", product_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if history_result.data:
+            history_id = history_result.data[0]["id"]
+            supabase_client.table("curation_history").delete().eq("id", history_id).execute()
+
         return jsonify({"success": True, "data": result.data})
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 
