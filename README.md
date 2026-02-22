@@ -540,6 +540,296 @@ python -m src.ai.tag_policy
 
 ---
 
+## Curation Workflow & Fine-Tuning Pipeline
+
+The curation system allows human reviewers to correct AI-generated tags, building a training dataset for fine-tuning a custom tagging model.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    CURATION & FINE-TUNING PIPELINE                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐              │
+│  │  CURATION    │───▶│   EXPORT     │───▶│  FINE-TUNE   │              │
+│  │     UI       │    │   JSONL      │    │   OPENAI     │              │
+│  │              │    │              │    │              │              │
+│  │ • Review AI  │    │ • Training   │    │ • Upload     │              │
+│  │   tags       │    │   format     │    │   dataset    │              │
+│  │ • Correct    │    │ • Curator    │    │ • Train      │              │
+│  │   errors     │    │   feedback   │    │   model      │              │
+│  │ • Add notes  │    │   included   │    │ • Deploy     │              │
+│  └──────────────┘    └──────────────┘    └──────────────┘              │
+│         │                                                               │
+│         ▼                                                               │
+│  ┌──────────────────────────────────────────────────────┐              │
+│  │                    SUPABASE                           │              │
+│  │  ┌────────────┐  ┌─────────────────┐  ┌───────────┐  │              │
+│  │  │  products  │  │ curation_history│  │ curation_ │  │              │
+│  │  │            │  │                 │  │  status   │  │              │
+│  │  │ curated_at │  │ original_ai_tags│  │           │  │              │
+│  │  │ curated_by │  │ corrected_tags  │  │ curator   │  │              │
+│  │  │ tags_final │  │ change_summary  │  │ status    │  │              │
+│  │  └────────────┘  └─────────────────┘  └───────────┘  │              │
+│  └──────────────────────────────────────────────────────┘              │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Quick Start: Curation
+
+```bash
+# Navigate to project (auto-activates venv via direnv)
+cd /path/to/refitd-etl
+
+# Start curation server
+python curate.py
+
+# Opens at http://127.0.0.1:8000
+```
+
+### Curation UI Workflow
+
+1. **Select curator name** from dropdown
+2. **Navigate to product** using Previous/Next or category filters
+3. **Review AI-generated tags** (shown with confidence scores)
+4. **Make corrections:**
+   - **Remove tags:** Click ✕ on incorrect tags, enter reason in modal
+   - **Add tags:** Use dropdown to add missing tags, enter reason
+   - **Modify tags:** Change values, enter reason for the change
+5. **Set metadata:**
+   - Check applicable error type boxes
+   - Set confidence rating (1-5)
+   - Add optional notes
+6. **Click "Mark as Complete"**
+
+### What Gets Saved
+
+When you click "Mark as Complete", the system saves:
+
+| Table | Fields Updated |
+|-------|----------------|
+| `products` | `curated_at`, `curated_by`, `training_eligible`, `tags_final` |
+| `curation_status` | `product_id`, `curator`, `status`, `notes` |
+| `curation_history` | Full record for training export (see below) |
+
+**`curation_history` record:**
+```json
+{
+  "product_id": "00761437_blue",
+  "original_ai_tags": { /* tags_ai_raw snapshot */ },
+  "corrected_tags": { /* tags_final with feedback */ },
+  "change_summary": "Removed 'everyday' from context; Added 'work-appropriate' to context; Changed fit from 'oversized' to 'baggy'",
+  "curator_notes": "Optional general notes",
+  "error_types": ["incorrect_value", "missing_tag"],
+  "confidence_in_correction": 4,
+  "include_in_training": true,
+  "curator_id": "Kiki"
+}
+```
+
+### Export Training Data
+
+Export curated products in OpenAI fine-tuning format (JSONL):
+
+```bash
+# Basic export
+python scripts/export_training_data.py --output-file training.jsonl
+
+# With options
+python scripts/export_training_data.py \
+  --output-file training.jsonl \
+  --min-confidence 4 \
+  --limit 500
+
+# Include all records (even those marked exclude from training)
+python scripts/export_training_data.py \
+  --output-file training.jsonl \
+  --no-approved-only
+```
+
+**Output format (each line):**
+```json
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a fashion item tagging system...\n\nCURATOR FEEDBACK\n- Removed 'everyday' from context: not appropriate for work\n- Added 'work-appropriate' to context: fits office dress code\n- Changed fit from 'oversized' to 'baggy': more accurate term"
+    },
+    {
+      "role": "user", 
+      "content": "{\"title\": \"Colorblock T-Shirt\", \"category\": \"Tops\", ...}"
+    },
+    {
+      "role": "assistant",
+      "content": "{\"style_identity\": [\"normcore\"], \"fit\": \"baggy\", ...}"
+    }
+  ]
+}
+```
+
+### Validate Training Data
+
+Check JSONL format before uploading to OpenAI:
+
+```bash
+python scripts/validate_training_data.py training.jsonl
+
+# Strict mode (treat warnings as errors)
+python scripts/validate_training_data.py training.jsonl --strict
+```
+
+**Validation checks:**
+- Valid JSON on each line
+- Correct message structure (system, user, assistant)
+- Required tags present (style_identity, fit, formality, etc.)
+- Tag values from controlled vocabulary
+
+**Example output:**
+```
+✅ Validation passed
+
+Statistics
+----------------------------------------
+  Total examples:  500
+  Est. tokens:     ~1,250,000
+  Avg tokens/example: ~2,500
+  Est. cost (GPT-4o): ~$31.25
+
+Category distribution
+----------------------------------------
+  Tops                             200
+  Bottoms                          150
+  Outerwear                        100
+  Footwear                          50
+```
+
+### Database Management
+
+```bash
+# Preview what will be deleted
+python scripts/wipe_database.py --dry-run
+
+# Wipe all data (requires confirmation)
+python scripts/wipe_database.py
+# Type: DELETE EVERYTHING
+
+# Force wipe without confirmation
+python scripts/wipe_database.py --force
+```
+
+**Tables wiped (in order for FK constraints):**
+1. `curation_history`
+2. `tag_correction_feedback`
+3. `rejected_inferred_tags`
+4. `curated_metadata`
+5. `curation_status`
+6. `ai_generated_tags`
+7. `products`
+
+### Verify Curation Data (SQL)
+
+Run in Supabase SQL Editor:
+
+```sql
+-- Check curated products
+SELECT product_id, name, curated_at, curated_by 
+FROM products 
+WHERE curated_at IS NOT NULL;
+
+-- Check curation history
+SELECT * FROM curation_history 
+ORDER BY created_at DESC 
+LIMIT 10;
+
+-- View tag feedback details
+SELECT 
+  product_id,
+  tags_final -> 'deleted_tags' as deleted_tags,
+  tags_final -> 'added_tags' as added_tags,
+  tags_final -> 'modified_tags' as modified_tags
+FROM products
+WHERE curated_at IS NOT NULL;
+```
+
+### Environment Setup (Auto-activation)
+
+The repo uses `direnv` for automatic environment activation:
+
+```bash
+# First time setup (if direnv not installed)
+brew install direnv
+
+# Add to your shell (choose one):
+# Fish:  echo 'direnv hook fish | source' >> ~/.config/fish/config.fish
+# Bash:  echo 'eval "$(direnv hook bash)"' >> ~/.bashrc
+# Zsh:   echo 'eval "$(direnv hook zsh)"' >> ~/.zshrc
+
+# Allow the .envrc file
+cd /path/to/refitd-etl
+direnv allow
+```
+
+**What happens on `cd`:**
+```
+direnv: loading ~/Desktop/scripts/refitd-etl/.envrc
+🔧 refitd-etl environment activated (Python venv + .env loaded)
+```
+
+### Fine-Tuning Workflow (End-to-End)
+
+```bash
+# 1. Start curation server
+python curate.py
+
+# 2. Curate 500-1000 products in browser
+#    http://127.0.0.1:8000
+
+# 3. Export training data
+python scripts/export_training_data.py -o training.jsonl
+
+# 4. Validate format
+python scripts/validate_training_data.py training.jsonl
+
+# 5. Upload to OpenAI and fine-tune
+openai api fine_tunes.create -t training.jsonl -m gpt-4o-2024-11-20
+
+# 6. Monitor training
+openai api fine_tunes.follow -i <fine_tune_id>
+
+# 7. Update tagger to use fine-tuned model
+# Edit src/ai/refitd_tagger.py: MODEL = "ft:gpt-4o-2024-11-20:..."
+```
+
+### Scripts Reference
+
+| Script | Purpose |
+|--------|---------|
+| `curate.py` | Curation UI server (Flask) |
+| `scripts/export_training_data.py` | Export to JSONL for fine-tuning |
+| `scripts/validate_training_data.py` | Validate JSONL format |
+| `scripts/wipe_database.py` | Clean database for fresh start |
+| `scripts/manage_fine_tune.py` | OpenAI fine-tuning management |
+
+### Troubleshooting
+
+**Export returns "No training examples found":**
+- Ensure products are marked complete in curation UI
+- Check `curation_history` table has records
+- Try `--no-approved-only` flag
+
+**Validation fails with missing tags:**
+- Some tags may be intentionally null (e.g., removed by curator)
+- Check if it's a false positive on nullable fields
+- Use `--strict` only for final validation
+
+**Curation UI shows "Curated" but database is empty:**
+- This was a bug, now fixed in `curate.py`
+- Ensure you're running the latest version
+
+---
+
 ## License
 
 Private repository. All rights reserved.
